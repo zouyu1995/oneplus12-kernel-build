@@ -1,0 +1,234 @@
+name: Build OnePlus12 Kernel (SukiSU-Ultra + SUSFS + KPM + memdump)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "manifest file"
+        default: "oneplus_12_b.xml"
+        required: true
+      bazel_target:
+        description: "bazel target"
+        default: "pineapple"
+        required: true
+      use_patch_linux:
+        description: "KPM (patch_linux) y/n"
+        default: "y"
+        required: true
+      apply_lz4kd:
+        description: "lz4kd patch y/n"
+        default: "y"
+        required: true
+      ksu_type:
+        description: "ksu type: sukisu-ultra / kernelsu-next"
+        default: "sukisu-ultra"
+        required: true
+      extra_configs:
+        description: "extra CONFIG lines (space or comma separated, KEY=VAL)"
+        default: "CONFIG_CHECKPOINT_RESTORE=y CONFIG_PROCESS_VMMAP=y CONFIG_PROC_KCORE=y CONFIG_DEVMEM=y CONFIG_BPF=y CONFIG_BPF_SYSCALL=y CONFIG_BPF_JIT=y CONFIG_KPROBES=y CONFIG_KPROBE_EVENTS=y CONFIG_UPROBE_EVENTS=y CONFIG_FTRACE=y CONFIG_KALLSYMS_ALL=y CONFIG_MODULES=y CONFIG_MODULE_UNLOAD=y"
+        required: false
+  push:
+    branches: [ main ]
+
+env:
+  SOC_BRANCH: sm8650
+  CUSTOM_SUFFIX: "oneplus12-sukisu"
+  KSU_TYPE: ${{ github.event.inputs.ksu_type || 'sukisu-ultra' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl zip perl make gcc python3 python3-pip bison flex libssl-dev bc cpio rsync
+          pip3 install --upgrade pip
+
+      - name: Setup repo tool
+        run: |
+          mkdir -p ~/bin
+          curl --tlsv1.2 -LSs -o ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: repo init & sync
+        run: |
+          set -e
+          MANIFEST="${{ github.event.inputs.manifest || 'oneplus_12_b.xml' }}"
+          echo "manifest=$MANIFEST SOC=$SOC_BRANCH"
+          mkdir -p kernel_workspace && cd kernel_workspace
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${SOC_BRANCH} -m ${MANIFEST} --depth=1
+          repo sync -j8 --fail-fast
+          df -h
+
+      - name: Clean abi & version suffix
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          rm -f common/android/abi_gki_protected_exports_* || true
+          rm -f msm-kernel/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion msm-kernel/scripts/setlocalversion external/dtc/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f" || true
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f" || true
+            sed -i "\$s|echo \"\$res\"|echo \"-${CUSTOM_SUFFIX}\"|" "$f" || true
+          done
+
+      - name: Integrate SukiSU-Ultra (with SUSFS)
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev || {
+            echo ">>> setup.sh failed, trying full clone fallback"
+            git clone https://github.com/ShirkNeko/SukiSU-Ultra -b main KernelSU
+          }
+          cd KernelSU
+          KSU_VERSION=$(expr $(git rev-list --count main 2>/dev/null || echo 100) "+" 10606)
+          export KSU_VERSION=$KSU_VERSION
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile || true
+          cd -
+
+      - name: Clone patch repos
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android14-6.1 --depth=1
+          git clone https://github.com/Xiaomichael/kernel_patches.git --depth=1
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git --depth=1
+
+      - name: Apply SUSFS patches
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch ./common/
+          cp ./kernel_patches/next/syscall_hooks.patch ./common/ || true
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/ || true
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ || true
+          cd ./common
+          patch -p1 < 50_add_susfs_in_gki-android14-6.1.patch || true
+          cp ../kernel_patches/69_hide_stuff.patch ./ || true
+          patch -p1 -F 3 < 69_hide_stuff.patch || true
+          patch -p1 -F 3 < syscall_hooks.patch || true
+
+      - name: Apply LZ4KD patch
+        if: ${{ github.event.inputs.apply_lz4kd != 'n' }}
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          cp -r ./SukiSU_patch/other/zram/lz4k/include/linux/* ./common/include/linux/ || true
+          cp -r ./SukiSU_patch/other/zram/lz4k/lib/* ./common/lib/ || true
+          cp -r ./SukiSU_patch/other/zram/lz4k/crypto/* ./common/crypto/ || true
+          cp ./SukiSU_patch/other/zram/zram_patch/6.1/lz4kd.patch ./common/ || true
+          cd ./common
+          patch -p1 -F 3 < lz4kd.patch || true
+
+      - name: Append defconfig
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          DF=./common/arch/arm64/configs/gki_defconfig
+          cat >> "$DF" <<EOF
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_KSU_MANUAL_HOOK=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+          if [[ "${{ github.event.inputs.use_patch_linux || 'y' }}" != "n" ]]; then
+            echo "CONFIG_KPM=y" >> "$DF"
+          fi
+          if [[ "${{ github.event.inputs.apply_lz4kd || 'y' }}" != "n" ]]; then
+            cat >> "$DF" <<EOF
+          CONFIG_ZSMALLOC=y
+          CONFIG_CRYPTO_LZ4HC=y
+          CONFIG_CRYPTO_LZ4K=y
+          CONFIG_CRYPTO_LZ4KD=y
+          CONFIG_CRYPTO_842=y
+          EOF
+          fi
+          # ===== extra CONFIG (memdump/BPF/etc) =====
+          EXTRAS="${{ github.event.inputs.extra_configs }}"
+          if [ -z "$EXTRAS" ]; then
+            EXTRAS="CONFIG_CHECKPOINT_RESTORE=y CONFIG_PROCESS_VMMAP=y CONFIG_PROC_KCORE=y CONFIG_DEVMEM=y CONFIG_BPF=y CONFIG_BPF_SYSCALL=y CONFIG_BPF_JIT=y CONFIG_KPROBES=y CONFIG_KPROBE_EVENTS=y CONFIG_UPROBE_EVENTS=y CONFIG_FTRACE=y CONFIG_KALLSYMS_ALL=y CONFIG_MODULES=y CONFIG_MODULE_UNLOAD=y"
+          fi
+          EXTRAS=$(echo "$EXTRAS" | tr ',' ' ')
+          echo ">>> appending extra configs:"
+          for kv in $EXTRAS; do
+            echo "$kv" | grep -q '=' && echo "$kv" >> "$DF" && echo "  + $kv"
+          done
+          # disable defconfig check
+          sed -i 's/check_defconfig//' ./common/build.config.gki || true
+          echo "=== tail of defconfig ==="
+          tail -40 "$DF"
+
+      - name: Build with bazel
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          BAZEL_TARGET="${{ github.event.inputs.bazel_target || 'pineapple' }}"
+          echo "target=$BAZEL_TARGET"
+          ./build_with_bazel.py -t "$BAZEL_TARGET" gki 2>&1 | tail -100
+          df -h
+
+      - name: patch_linux (KPM)
+        if: ${{ github.event.inputs.use_patch_linux != 'n' }}
+        run: |
+          set -e
+          BAZEL_TARGET="${{ github.event.inputs.bazel_target || 'pineapple' }}"
+          OUT_DIR="./kernel_workspace/kernel_platform/out/msm-kernel-${BAZEL_TARGET}-gki/dist"
+          cd "$OUT_DIR"
+          curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image
+          mv oImage Image
+          ls -la
+
+      - name: Package AnyKernel3
+        run: |
+          set -e
+          BAZEL_TARGET="${{ github.event.inputs.bazel_target || 'pineapple' }}"
+          OUT_DIR="./kernel_workspace/kernel_platform/out/msm-kernel-${BAZEL_TARGET}-gki/dist"
+          MANIFEST="${{ github.event.inputs.manifest || 'oneplus_12_b.xml' }}"
+          git clone https://github.com/Suxiaoqinx/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cp "$OUT_DIR/Image" ./AnyKernel3/
+          cd ./AnyKernel3
+          if [[ "${{ github.event.inputs.apply_lz4kd || 'y' }}" != "n" ]]; then
+            curl -LO https://raw.githubusercontent.com/Suxiaoqinx/kernel_manifest_OnePlus_Sukisu_Ultra/main/zram.zip || true
+          fi
+          MB=$(basename "$MANIFEST" .xml)
+          NAME="Anykernel3-${MB}-sukisu-susfs-kpm-memdump-v$(date +%Y%m%d).zip"
+          zip -r "../$NAME" ./* >/dev/null
+          echo "ZIP=../$NAME"
+          realpath "../$NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3-oneplus12
+          path: "*.zip"
+          retention-days: 30
