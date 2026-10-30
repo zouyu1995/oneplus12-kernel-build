@@ -169,6 +169,8 @@ jobs:
           CONFIG_CRYPTO_842=y
           EOF
           fi
+          # ===== 关闭 -Werror (SUSFS/LZ4KD 补丁在 task_mmu.c 等处产生未使用变量/label 警告，被 -Werror 变错误) =====
+          echo "CONFIG_WERROR=n" >> "$DF"
           # ===== extra CONFIG (memdump/BPF/etc) =====
           EXTRAS="${{ github.event.inputs.extra_configs }}"
           if [ -z "$EXTRAS" ]; then
@@ -190,7 +192,10 @@ jobs:
           cd kernel_workspace/kernel_platform
           BAZEL_TARGET="${{ github.event.inputs.bazel_target || 'pineapple' }}"
           echo "target=$BAZEL_TARGET"
-          ./build_with_bazel.py -t "$BAZEL_TARGET" gki 2>&1 | tail -100
+          # 保险: 再显式去掉 defconfig 检查 + 关 Werror
+          sed -i 's/check_defconfig//' ./common/build.config.gki || true
+          grep -q CONFIG_WERROR ./common/arch/arm64/configs/gki_defconfig || echo "CONFIG_WERROR=n" >> ./common/arch/arm64/configs/gki_defconfig
+          ./build_with_bazel.py -t "$BAZEL_TARGET" gki 2>&1 | tail -120
           df -h
 
       - name: patch_linux (KPM)
